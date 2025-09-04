@@ -4,7 +4,7 @@ use jito_protos::shredstream::{
 
 #[tokio::main]
 async fn main() -> Result<(), std::io::Error> {
-    let mut client = ShredstreamProxyClient::connect("http://127.0.0.1:9999")
+    let mut client = ShredstreamProxyClient::connect("http://34.159.110.120:9999")
         .await
         .unwrap();
     let mut stream = client

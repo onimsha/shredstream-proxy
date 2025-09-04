@@ -6,6 +6,14 @@ authors = { workspace = true }
 homepage = { workspace = true }
 edition = { workspace = true }
 
+[lib]
+name = "jito_shredstream_proxy"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jito-shredstream-proxy"
+path = "src/main.rs"
+
 [dependencies]
 ahash = { workspace = true }
 arc-swap = { workspace = true }
@@ -36,3 +44,13 @@ solana-streamer = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "deshred_benchmark"
+harness = false
+
+[profile.bench]
+debug = true
