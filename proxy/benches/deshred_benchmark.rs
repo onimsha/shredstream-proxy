@@ -2,10 +2,16 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Benchmark
 use jito_shredstream_proxy::deshred::{reconstruct_shreds, ComparableShred, ShredsStateTracker};
 use jito_shredstream_proxy::forwarder::ShredMetrics;
 use solana_ledger::shred::ReedSolomonCache;
-use solana_perf::packet::PacketBatch;
+use solana_perf::packet::{PacketBatch, Packet};
 use std::collections::HashSet;
 use std::sync::Arc;
 use ahash::HashMap;
+use borsh::BorshDeserialize;
+
+#[derive(BorshDeserialize)]
+struct Packets {
+    pub packets: Vec<Vec<u8>>,
+}
 
 fn setup_test_state() -> (
     HashMap<u64, (HashMap<u32, HashSet<ComparableShred>>, ShredsStateTracker)>,
@@ -29,10 +35,21 @@ fn load_test_data(path: &str) -> PacketBatch {
     // Try to load test data, fallback to empty batch if file doesn't exist
     match std::fs::read(path) {
         Ok(data) => {
-            match bincode::deserialize::<PacketBatch>(&data) {
-                Ok(batch) => batch,
-                Err(_) => {
-                    println!("Warning: Could not deserialize test data from {}, using empty batch", path);
+            match Packets::try_from_slice(&data) {
+                Ok(packets) => {
+                    // Convert Vec<Vec<u8>> to PacketBatch
+                    let mut batch = PacketBatch::default();
+                    for packet_data in packets.packets.into_iter().take(500) { // Limit for benchmarking
+                        let mut packet = Packet::default();
+                        let len = std::cmp::min(packet_data.len(), 1500); // Max packet size
+                        packet.buffer_mut()[..len].copy_from_slice(&packet_data[..len]);
+                        packet.meta_mut().size = len;
+                        batch.push(packet);
+                    }
+                    batch
+                }
+                Err(e) => {
+                    println!("Warning: Could not deserialize test data from {}: {}, using empty batch", path, e);
                     PacketBatch::default()
                 }
             }
@@ -72,8 +89,9 @@ fn benchmark_reconstruct_shreds(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("reconstruct_shreds");
     
-    // Set longer measurement time for more stable results
-    group.measurement_time(std::time::Duration::from_secs(10));
+    // Configure for different test data types
+    group.measurement_time(std::time::Duration::from_secs(15));
+    group.sample_size(50); // Reduce sample count for slower benchmarks
 
     for (name, packet_batch) in test_cases {
         if packet_batch.is_empty() && name.contains("real_data") {
