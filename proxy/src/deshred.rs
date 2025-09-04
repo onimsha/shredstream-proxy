@@ -74,6 +74,7 @@ pub fn reconstruct_shreds(
     highest_slot_seen: &mut Slot,
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
+    merkle_shreds_buffer: &mut Vec<Shred>,
 ) -> usize {
     deshredded_entries.clear();
     slot_fec_indexes_to_iterate.clear();
@@ -144,12 +145,15 @@ pub fn reconstruct_shreds(
         }
 
         // try to recover if we have enough shreds in the FEC set
-        let merkle_shreds = shreds
-            .iter()
-            .sorted_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()))
-            .map(|s| s.0.clone())
-            .collect_vec();
-        let recovered = match solana_ledger::shred::merkle::recover(merkle_shreds, rs_cache) {
+        // Use pre-allocated buffer to avoid allocation in hot path
+        merkle_shreds_buffer.clear();
+        merkle_shreds_buffer.extend(
+            shreds
+                .iter()
+                .sorted_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()))
+                .map(|s| s.0.clone())
+        );
+        let recovered = match solana_ledger::shred::merkle::recover(merkle_shreds_buffer.clone(), rs_cache) {
             Ok(r) => r, // data shreds followed by code shreds (whatever was missing from to_deshred_payload)
             Err(e) => {
                 warn!(
@@ -715,6 +719,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut merkle_shreds_buffer = Vec::with_capacity(64);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -734,6 +739,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut merkle_shreds_buffer,
         );
 
         // debug_to_disk(&mut deshredded_entries);
@@ -770,6 +776,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut merkle_shreds_buffer = Vec::with_capacity(64);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -791,6 +798,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut merkle_shreds_buffer,
         );
 
         // debug_to_disk(&deshredded_entries, "new.txt");
@@ -892,6 +900,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut merkle_shreds_buffer = Vec::with_capacity(64);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -911,6 +920,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut merkle_shreds_buffer,
         );
 
         // debug_to_disk(&mut deshredded_entries);
@@ -947,6 +957,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut merkle_shreds_buffer = Vec::with_capacity(64);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -968,6 +979,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut merkle_shreds_buffer,
         );
 
         // debug_to_disk(&deshredded_entries, "new.txt");
@@ -1048,6 +1060,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut merkle_shreds_buffer = Vec::with_capacity(64);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(packets.clone()),
             &mut all_shreds,
@@ -1056,6 +1069,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut merkle_shreds_buffer,
         );
         assert_eq!(recovered_count, 0);
         assert_eq!(
@@ -1075,6 +1089,7 @@ mod tests {
         let mut slot_fec_indexes_to_iterate: Vec<(Slot, u32)> = Vec::new();
         let mut deshredded_entries = Vec::new();
         let mut highest_slot_seen = 0;
+        let mut merkle_shreds_buffer = Vec::with_capacity(64);
         let recovered_count = reconstruct_shreds(
             PacketBatch::new(
                 packets
@@ -1090,6 +1105,7 @@ mod tests {
             &mut highest_slot_seen,
             &rs_cache,
             &metrics,
+            &mut merkle_shreds_buffer,
         );
         assert!(recovered_count > 0);
         assert_eq!(

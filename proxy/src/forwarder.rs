@@ -98,6 +98,7 @@ pub fn start_forwarder_threads(
                     Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
                 let mut highest_slot_seen: Slot = 0;
                 let rs_cache = ReedSolomonCache::default();
+                let mut merkle_shreds_buffer = Vec::<solana_ledger::shred::merkle::Shred>::with_capacity(64);
 
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
@@ -110,6 +111,7 @@ pub fn start_forwarder_threads(
                                 &mut highest_slot_seen,
                                 &rs_cache,
                                 &metrics,
+                                &mut merkle_shreds_buffer,
                             );
 
                             deshredded_entries.drain(..).for_each(
