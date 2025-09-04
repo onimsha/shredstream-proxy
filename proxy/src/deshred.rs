@@ -13,7 +13,11 @@ use solana_ledger::{
 };
 use solana_metrics::datapoint_warn;
 use solana_perf::packet::PacketBatch;
-use solana_sdk::clock::{Slot, MAX_PROCESSING_AGE};
+use solana_sdk::{
+    clock::{Slot, MAX_PROCESSING_AGE},
+    message::VersionedMessage,
+    pubkey::Pubkey,
+};
 
 use crate::forwarder::ShredMetrics;
 
@@ -213,10 +217,34 @@ pub fn reconstruct_shreds(
             }
         };
 
+        let target_accounts: HashSet<Pubkey> = vec![
+            "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+                .parse()
+                .unwrap(),
+            "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+                .parse()
+                .unwrap(),
+        ]
+        .into_iter()
+        .collect();
         let entries = match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(
             &deshredded_payload,
         ) {
-            Ok(entries) => entries,
+            Ok(entries) => entries
+                .into_iter()
+                .map(|mut entry| {
+                    entry.transactions.retain(|tx| match &tx.message {
+                        VersionedMessage::Legacy(msg) => {
+                            msg.account_keys.iter().any(|k| target_accounts.contains(k))
+                        }
+                        VersionedMessage::V0(msg) => {
+                            msg.account_keys.iter().any(|k| target_accounts.contains(k))
+                        }
+                    });
+                    entry
+                })
+                .filter(|e| !e.transactions.is_empty())
+                .collect::<Vec<_>>(),
             Err(e) => {
                 debug!(
                         "Failed to deserialize bincode payload of size {} for slot {slot}, start_data_complete_idx: {start_data_complete_idx}, end_data_complete_idx: {end_data_complete_idx}, unknown_start: {unknown_start}. Err: {e}",
@@ -233,6 +261,19 @@ pub fn reconstruct_shreds(
                 continue;
             }
         };
+
+        if entries.is_empty() {
+            continue;
+        }
+
+        let deshredded_payload = match bincode::serialize(&entries) {
+            Ok(payload) => payload,
+            Err(e) => {
+                warn!("Failed to serialize entries for slot {slot}: {e}");
+                continue;
+            }
+        };
+
         metrics
             .entry_count
             .fetch_add(entries.len() as u64, Ordering::Relaxed);
