@@ -17,6 +17,9 @@ edition = "2021"
 # thin has minimal overhead vs none (default): https://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html
 lto = "thin"
 
+[profile.bench]
+debug = true
+
 [workspace.dependencies]
 ahash = "0.8"
 arc-swap = "1.6"
