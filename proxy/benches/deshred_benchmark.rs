@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
 use jito_shredstream_proxy::deshred::{reconstruct_shreds, ComparableShred, ShredsStateTracker};
 use jito_shredstream_proxy::forwarder::ShredMetrics;
-use solana_ledger::shred::ReedSolomonCache;
+use solana_ledger::shred::{ReedSolomonCache, merkle::Shred};
 use solana_perf::packet::{PacketBatch, Packet};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,6 +20,7 @@ fn setup_test_state() -> (
     u64,
     Arc<ReedSolomonCache>,
     Arc<ShredMetrics>,
+    Vec<Shred>,
 ) {
     let all_shreds = HashMap::default();
     let slot_fec_indexes = Vec::new();
@@ -27,8 +28,9 @@ fn setup_test_state() -> (
     let highest_slot = 0u64;
     let rs_cache = Arc::new(ReedSolomonCache::default());
     let metrics = Arc::new(ShredMetrics::default());
+    let merkle_shreds_buffer = Vec::with_capacity(64);
     
-    (all_shreds, slot_fec_indexes, deshredded_entries, highest_slot, rs_cache, metrics)
+    (all_shreds, slot_fec_indexes, deshredded_entries, highest_slot, rs_cache, metrics, merkle_shreds_buffer)
 }
 
 fn load_test_data(path: &str) -> PacketBatch {
@@ -102,7 +104,7 @@ fn benchmark_reconstruct_shreds(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("current", name), &packet_batch, |b, packets| {
             b.iter_batched(
                 || setup_test_state(),
-                |(mut all_shreds, mut slot_fec_indexes, mut deshredded_entries, mut highest_slot, rs_cache, metrics)| {
+                |(mut all_shreds, mut slot_fec_indexes, mut deshredded_entries, mut highest_slot, rs_cache, metrics, mut merkle_shreds_buffer)| {
                     black_box(reconstruct_shreds(
                         packets.clone(),
                         &mut all_shreds,
@@ -111,6 +113,7 @@ fn benchmark_reconstruct_shreds(c: &mut Criterion) {
                         &mut highest_slot,
                         &rs_cache,
                         &metrics,
+                        &mut merkle_shreds_buffer,
                     ))
                 },
                 criterion::BatchSize::SmallInput,
