@@ -1,4 +1,4 @@
-use std::{collections::HashSet, hash::Hash, sync::atomic::Ordering};
+use std::{collections::HashSet, hash::Hash, sync::atomic::{AtomicU64, Ordering}};
 
 use itertools::Itertools;
 use jito_protos::shredstream::TraceShred;
@@ -21,6 +21,8 @@ use solana_sdk::{
 
 use crate::forwarder::ShredMetrics;
 
+static BATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
 enum ShredStatus {
     #[default]
@@ -29,6 +31,24 @@ enum ShredStatus {
     NotDataComplete,
     /// Shred that is marked as [ShredFlags::DATA_COMPLETE_SHRED]
     DataComplete,
+}
+
+#[derive(Debug, Clone)]
+struct SegmentInfo {
+    state: SegmentState,
+    attempt_count: u8,
+    last_attempt_slot: Slot,
+    start_idx: usize,
+    end_idx: usize,
+}
+
+#[derive(Default, Debug, Copy, Clone, Eq, PartialEq)]
+enum SegmentState {
+    #[default]
+    Pending,        // Still gathering shreds
+    TriedOnce,      // One attempt failed - waiting for new information
+    FinalizedGood,  // Successfully decoded and forwarded
+    FinalizedBad,   // Timed out or slot aged out - safe to drop
 }
 
 /// Tracks per-slot shred information for data shreds
@@ -43,6 +63,8 @@ pub struct ShredsStateTracker {
     already_recovered_fec_sets: Vec<bool>,
     /// array of bools that track which data shred indexes have been already deshredded
     already_deshredded: Vec<bool>,
+    /// Segment tracking for retry logic - maps (start_idx, end_idx) to SegmentInfo
+    segments: std::collections::HashMap<(usize, usize), SegmentInfo>,
 }
 impl Default for ShredsStateTracker {
     fn default() -> Self {
@@ -51,6 +73,7 @@ impl Default for ShredsStateTracker {
             data_shreds: vec![None; MAX_DATA_SHREDS_PER_SLOT],
             already_recovered_fec_sets: vec![false; MAX_DATA_SHREDS_PER_SLOT],
             already_deshredded: vec![false; MAX_DATA_SHREDS_PER_SLOT],
+            segments: std::collections::HashMap::new(),
         }
     }
 }
@@ -75,7 +98,9 @@ pub fn reconstruct_shreds(
     rs_cache: &ReedSolomonCache,
     metrics: &ShredMetrics,
     merkle_shreds_buffer: &mut Vec<Shred>,
-) -> usize {
+) -> (usize, u64) {
+    let batch_id = BATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    log::info!("🔄 BATCH #{} START: reconstruct_shreds with {} packets", batch_id, packet_batch.len());
     deshredded_entries.clear();
     slot_fec_indexes_to_iterate.clear();
     // ingest all packets
@@ -355,7 +380,402 @@ pub fn reconstruct_shreds(
             .fetch_add(total_recovered_count as u64, Ordering::Relaxed);
     }
 
-    total_recovered_count
+    log::info!("✅ BATCH #{} END: reconstruct_shreds completed, {} entries reconstructed", batch_id, deshredded_entries.len());
+    (total_recovered_count, batch_id)
+}
+
+/// Streaming version that sends entries immediately as they become available
+/// This reduces latency by not waiting for the entire batch to complete
+pub fn reconstruct_shreds_streaming<F>(
+    packet_batch: PacketBatch,
+    all_shreds: &mut ahash::HashMap<
+        Slot,
+        (
+            ahash::HashMap<u32 /* fec_set_index */, HashSet<ComparableShred>>,
+            ShredsStateTracker,
+        ),
+    >,
+    slot_fec_indexes_to_iterate: &mut Vec<(Slot, u32)>,
+    highest_slot_seen: &mut Slot,
+    rs_cache: &ReedSolomonCache,
+    metrics: &ShredMetrics,
+    merkle_shreds_buffer: &mut Vec<Shred>,
+    mut on_entry_ready: F,
+) -> (usize, u64)
+where
+    F: FnMut(Slot, Vec<u8>), // Callback for immediate entry sending
+{
+    let batch_id = BATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Only log batch start in debug mode to reduce noise
+    debug!("🔄 BATCH #{} START: reconstruct_shreds_streaming with {} packets", batch_id, packet_batch.len());
+    
+    slot_fec_indexes_to_iterate.clear();
+    let total_recovered_count = 0;
+    let mut immediate_entries_sent = 0;
+    
+    // ingest all packets
+    for packet in packet_batch.iter().filter_map(|p| p.data(..)) {
+        match solana_ledger::shred::Shred::new_from_serialized_shred(packet.to_vec())
+            .and_then(Shred::try_from)
+        {
+            Ok(shred) => {
+                let slot = shred.common_header().slot;
+                let index = shred.index() as usize;
+                let fec_set_index = shred.fec_set_index();
+                let (all_shreds, state_tracker) = all_shreds.entry(slot).or_default();
+                if highest_slot_seen.saturating_sub(SLOT_LOOKBACK) > slot {
+                    debug!(
+                        "Old shred slot: {slot}, fec_set_index: {fec_set_index}, index: {index}"
+                    );
+                    continue;
+                }
+                if state_tracker.already_recovered_fec_sets[fec_set_index as usize]
+                    || state_tracker.already_deshredded[index]
+                {
+                    debug!("Already completed slot: {slot}, fec_set_index: {fec_set_index}, index: {index}");
+                    continue;
+                }
+                let Some(_shred_index) = update_state_tracker(&shred, state_tracker) else {
+                    continue;
+                };
+
+                all_shreds
+                    .entry(fec_set_index)
+                    .or_default()
+                    .insert(ComparableShred(shred));
+                slot_fec_indexes_to_iterate.push((slot, fec_set_index));
+                *highest_slot_seen = std::cmp::max(*highest_slot_seen, slot);
+
+                // 🚀 STREAMING OPTIMIZATION: Try smart decode after each shred
+                if let Some(entry_data) = try_decode_with_retry(
+                    slot,
+                    fec_set_index,
+                    all_shreds,
+                    state_tracker,
+                    rs_cache,
+                    metrics,
+                    merkle_shreds_buffer,
+                    batch_id,
+                ) {
+                    log::info!("⚡ BATCH #{} IMMEDIATE SEND: entry for slot {} (streaming)", batch_id, slot);
+                    on_entry_ready(slot, entry_data);
+                    immediate_entries_sent += 1;
+                }
+            }
+            Err(e) => {
+                if jito_protos::shredstream::TraceShred::decode(packet).is_ok() {
+                    continue;
+                }
+                warn!("Failed to decode shred. Err: {e:?}");
+            }
+        }
+    }
+
+    // 🧹 MEMORY CLEANUP: Remove old slots and finalized segments
+    if batch_id % 100 == 0 {
+        let cutoff_slot = highest_slot_seen.saturating_sub(SLOT_LOOKBACK);
+        cleanup_old_data(all_shreds, cutoff_slot);
+        debug!("BATCH #{} CLEANUP: removed slots older than {}", batch_id, cutoff_slot);
+    }
+
+    if immediate_entries_sent > 0 {
+        log::info!("✅ BATCH #{} END: reconstruct_shreds_streaming completed, {} entries sent immediately", batch_id, immediate_entries_sent);
+    }
+    (total_recovered_count, batch_id)
+}
+
+/// Smart decoding with retry logic - doesn't mark as processed on failure
+fn try_decode_with_retry(
+    slot: Slot,
+    fec_set_index: u32,
+    all_shreds: &mut ahash::HashMap<u32, HashSet<ComparableShred>>,
+    state_tracker: &mut ShredsStateTracker,
+    rs_cache: &ReedSolomonCache,
+    _metrics: &ShredMetrics,
+    merkle_shreds_buffer: &mut Vec<Shred>,
+    batch_id: u64,
+) -> Option<Vec<u8>> {
+    let shreds = all_shreds.entry(fec_set_index).or_default();
+    let (
+        num_expected_data_shreds,
+        _num_expected_coding_shreds,
+        num_data_shreds,
+        _num_coding_shreds,
+    ) = get_data_shred_info(shreds);
+
+    // 🛡️ SAFETY CHECK: Prevent duplicate processing of same FEC set
+    if state_tracker.already_recovered_fec_sets[fec_set_index as usize] {
+        return None; // Already processed this FEC set
+    }
+
+    // Check if we can decode (all data shreds available or enough for FEC recovery)
+    let min_shreds_needed_to_recover = num_expected_data_shreds as usize;
+    let can_decode = if num_data_shreds == num_expected_data_shreds {
+        // All data shreds present - can decode immediately
+        true
+    } else if num_expected_data_shreds > 0 && shreds.len() >= min_shreds_needed_to_recover {
+        // Enough shreds for FEC recovery
+        true
+    } else {
+        false
+    };
+
+    if !can_decode {
+        return None;
+    }
+
+    // Try FEC recovery if needed
+    if num_data_shreds < num_expected_data_shreds {
+        merkle_shreds_buffer.clear();
+        merkle_shreds_buffer.extend(
+            shreds
+                .iter()
+                .sorted_by_key(|s| (u8::MAX - s.shred_type() as u8, s.index()))
+                .map(|s| s.0.clone())
+        );
+        
+        let recovered = match solana_ledger::shred::merkle::recover(merkle_shreds_buffer.clone(), rs_cache) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "Failed to recover shreds for slot {slot} fec_set_index {fec_set_index}. Err: {e}",
+                );
+                return None;
+            }
+        };
+
+        // Update state tracker with recovered shreds
+        for shred in recovered {
+            if let Ok(shred) = shred {
+                update_state_tracker(&shred, state_tracker);
+            }
+        }
+    }
+
+    // Try to find a complete segment to deshred
+    let Some((start_data_complete_idx, end_data_complete_idx, _unknown_start)) =
+        get_indexes(state_tracker, fec_set_index as usize)
+    else {
+        return None;
+    };
+
+    let segment_key = (start_data_complete_idx, end_data_complete_idx);
+    
+    // Check segment state - implement retry logic with improved conditions
+    let segment_info = state_tracker.segments.get(&segment_key);
+    let current_shred_count = shreds.len();
+    
+    let should_attempt = match segment_info {
+        None => true, // First attempt
+        Some(info) => {
+            match info.state {
+                SegmentState::Pending => true,
+                SegmentState::TriedOnce => {
+                    // Only retry if:
+                    // 1. Haven't exceeded max attempts
+                    // 2. Not too old
+                    // 3. Have MORE shreds than last attempt (new information!)
+                    info.attempt_count < MAX_SEGMENT_ATTEMPTS 
+                        && slot.saturating_sub(info.last_attempt_slot) <= SLOT_LOOKBACK
+                        && current_shred_count > (num_expected_data_shreds as usize) // Wait for extra shreds
+                }
+                SegmentState::FinalizedGood | SegmentState::FinalizedBad => false,
+            }
+        }
+    };
+
+    if !should_attempt {
+        return None;
+    }
+
+    // Attempt to deshred and decode
+    let to_deshred = &state_tracker.data_shreds[start_data_complete_idx..=end_data_complete_idx];
+    
+    let deshredded_payload = match solana_ledger::shred::Shredder::deshred(
+        to_deshred.iter().map(|s| s.as_ref().unwrap().payload()),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("slot {slot} failed to deshred: {e}");
+            mark_segment_retry(state_tracker, segment_key, slot);
+            return None;
+        }
+    };
+
+    // 🛡️ SAFETY CHECK: Validate payload size before deserialization
+    if deshredded_payload.len() < 8 {
+        warn!("slot {slot} fec_set {fec_set_index}: payload too small ({} bytes)", deshredded_payload.len());
+        mark_segment_retry(state_tracker, segment_key, slot);
+        return None;
+    }
+
+    // Apply filtering logic
+    let target_accounts: HashSet<solana_sdk::pubkey::Pubkey> = vec![
+        "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA".parse().unwrap(),
+        "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P".parse().unwrap(),
+    ].into_iter().collect();
+
+    let entries = match bincode::deserialize::<Vec<solana_entry::entry::Entry>>(&deshredded_payload) {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|mut entry| {
+                entry.transactions.retain(|tx| match &tx.message {
+                    solana_sdk::message::VersionedMessage::Legacy(msg) => {
+                        msg.account_keys.iter().any(|k| target_accounts.contains(k))
+                    }
+                    solana_sdk::message::VersionedMessage::V0(msg) => {
+                        msg.account_keys.iter().any(|k| target_accounts.contains(k))
+                    }
+                });
+                entry
+            })
+            .filter(|e| !e.transactions.is_empty())
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            let error_msg = e.to_string();
+            // Classify error types for better retry decisions
+            let should_retry = if error_msg.contains("continue signal") 
+                || error_msg.contains("unexpected end of file") 
+                || error_msg.contains("failed to fill whole buffer") {
+                // These are "incomplete data" errors - worth retrying
+                true
+            } else if error_msg.contains("invalid value: integer") 
+                && error_msg.contains("expected a valid transaction message version") {
+                // Corruption errors - also worth retrying with more shreds
+                true  
+            } else {
+                // Other errors might be structural issues
+                false
+            };
+            
+            if should_retry {
+                warn!("slot {slot} fec_set {fec_set_index}: failed to deserialize entries (will retry): {e}");
+                mark_segment_retry(state_tracker, segment_key, slot);
+            } else {
+                warn!("slot {slot} fec_set {fec_set_index}: failed to deserialize entries (permanent): {e}");
+                mark_segment_bad(state_tracker, segment_key);
+            }
+            return None;
+        }
+    };
+
+    if entries.is_empty() {
+        mark_segment_retry(state_tracker, segment_key, slot);
+        return None;
+    }
+
+    // 🎉 SUCCESS: Mark segment as completed and shreds as processed
+    // Collect shred indices before borrowing state_tracker mutably
+    let shred_indices: Vec<usize> = to_deshred.iter()
+        .filter_map(|shred| shred.as_ref().map(|s| s.index() as usize))
+        .collect();
+    
+    mark_segment_success(state_tracker, segment_key, shred_indices, fec_set_index);
+    all_shreds.remove(&fec_set_index);
+
+    log::info!("📦 BATCH #{} SUCCESS: slot {} fec_set {} with {} entries", batch_id, slot, fec_set_index, entries.len());
+    
+    // Return FILTERED serialized entries for sending
+    match bincode::serialize(&entries) {
+        Ok(filtered_payload) => Some(filtered_payload),
+        Err(e) => {
+            warn!("slot {slot} fec_set {fec_set_index}: failed to serialize filtered entries: {e}");
+            None
+        }
+    }
+}
+
+/// Mark a segment for retry after failure
+fn mark_segment_retry(
+    state_tracker: &mut ShredsStateTracker,
+    segment_key: (usize, usize),
+    current_slot: Slot,
+) {
+    let entry = state_tracker.segments.entry(segment_key).or_insert(SegmentInfo {
+        state: SegmentState::Pending,
+        attempt_count: 0,
+        last_attempt_slot: current_slot,
+        start_idx: segment_key.0,
+        end_idx: segment_key.1,
+    });
+    
+    entry.attempt_count += 1;
+    entry.last_attempt_slot = current_slot;
+    
+    if entry.attempt_count >= MAX_SEGMENT_ATTEMPTS {
+        entry.state = SegmentState::FinalizedBad;
+        debug!("Segment {:?} marked as FinalizedBad after {} attempts", segment_key, entry.attempt_count);
+    } else {
+        entry.state = SegmentState::TriedOnce;
+        debug!("Segment {:?} marked for retry (attempt {})", segment_key, entry.attempt_count);
+    }
+}
+
+/// Mark a segment as successfully processed
+fn mark_segment_success(
+    state_tracker: &mut ShredsStateTracker,
+    segment_key: (usize, usize),
+    shred_indices: Vec<usize>,
+    fec_set_index: u32,
+) {
+    // Mark individual shreds as processed
+    for shred_index in shred_indices {
+        state_tracker.already_deshredded[shred_index] = true;
+    }
+    
+    // Mark FEC set as recovered
+    state_tracker.already_recovered_fec_sets[fec_set_index as usize] = true;
+    
+    // Update segment state
+    state_tracker.segments.insert(segment_key, SegmentInfo {
+        state: SegmentState::FinalizedGood,
+        attempt_count: 0,
+        last_attempt_slot: 0,
+        start_idx: segment_key.0,
+        end_idx: segment_key.1,
+    });
+    
+    debug!("Segment {:?} successfully processed", segment_key);
+}
+
+/// Mark a segment as permanently failed (no more retries)
+fn mark_segment_bad(
+    state_tracker: &mut ShredsStateTracker,
+    segment_key: (usize, usize),
+) {
+    state_tracker.segments.insert(segment_key, SegmentInfo {
+        state: SegmentState::FinalizedBad,
+        attempt_count: MAX_SEGMENT_ATTEMPTS,
+        last_attempt_slot: 0,
+        start_idx: segment_key.0,
+        end_idx: segment_key.1,
+    });
+    debug!("Segment {:?} marked as permanently failed", segment_key);
+}
+
+/// Clean up old data and segments to prevent memory leaks
+fn cleanup_old_data(
+    all_shreds: &mut ahash::HashMap<
+        Slot,
+        (
+            ahash::HashMap<u32, HashSet<ComparableShred>>,
+            ShredsStateTracker,
+        ),
+    >,
+    cutoff_slot: Slot,
+) {
+    all_shreds.retain(|&slot, (_, state_tracker)| {
+        if slot < cutoff_slot {
+            return false; // Remove old slots entirely
+        }
+        
+        // Clean up finalized segments for remaining slots
+        state_tracker.segments.retain(|_, segment_info| {
+            !matches!(segment_info.state, SegmentState::FinalizedGood | SegmentState::FinalizedBad)
+        });
+        
+        true
+    });
 }
 
 #[allow(unused)]
@@ -489,6 +909,8 @@ fn update_state_tracker(shred: &Shred, state_tracker: &mut ShredsStateTracker) -
 }
 
 const SLOT_LOOKBACK: Slot = 50;
+const MAX_SEGMENT_ATTEMPTS: u8 = 3;
+const MEMORY_CAP_BYTES: usize = 512 * 1024 * 1024; // 512 MB
 
 /// check if we can reconstruct (having minimum number of data + coding shreds)
 fn get_data_shred_info(
@@ -743,7 +1165,7 @@ mod tests {
         );
 
         // debug_to_disk(&mut deshredded_entries);
-        assert!(recovered_count < deshredded_entries.len());
+        assert!(recovered_count.0 < deshredded_entries.len());
         assert_eq!(
             deshredded_entries
                 .iter()
@@ -802,7 +1224,7 @@ mod tests {
         );
 
         // debug_to_disk(&deshredded_entries, "new.txt");
-        assert!(recovered_count > (deshredded_entries.len() / 4));
+        assert!(recovered_count.0 > (deshredded_entries.len() / 4));
         assert_eq!(
             deshredded_entries
                 .iter()
@@ -924,7 +1346,7 @@ mod tests {
         );
 
         // debug_to_disk(&mut deshredded_entries);
-        assert!(recovered_count < deshredded_entries.len());
+        assert!(recovered_count.0 < deshredded_entries.len());
         assert_eq!(
             deshredded_entries
                 .iter()
@@ -983,7 +1405,7 @@ mod tests {
         );
 
         // debug_to_disk(&deshredded_entries, "new.txt");
-        assert!(recovered_count > (deshredded_entries.len() / 4));
+        assert!(recovered_count.0 > (deshredded_entries.len() / 4));
         assert_eq!(
             deshredded_entries
                 .iter()
@@ -1071,7 +1493,7 @@ mod tests {
             &metrics,
             &mut merkle_shreds_buffer,
         );
-        assert_eq!(recovered_count, 0);
+        assert_eq!(recovered_count.0, 0);
         assert_eq!(
             deshredded_entries
                 .iter()
@@ -1107,7 +1529,7 @@ mod tests {
             &metrics,
             &mut merkle_shreds_buffer,
         );
-        assert!(recovered_count > 0);
+        assert!(recovered_count.0 > 0);
         assert_eq!(
             deshredded_entries
                 .iter()

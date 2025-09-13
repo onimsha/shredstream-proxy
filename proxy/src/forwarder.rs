@@ -94,7 +94,7 @@ pub fn start_forwarder_threads(
                     ),
                 >::default();
                 let mut slot_fec_indexes_to_iterate = Vec::<(Slot, u32)>::new();
-                let mut deshredded_entries =
+                let _deshredded_entries =
                     Vec::<(Slot, Vec<solana_entry::entry::Entry>, Vec<u8>)>::new();
                 let mut highest_slot_seen: Slot = 0;
                 let rs_cache = ReedSolomonCache::default();
@@ -103,20 +103,19 @@ pub fn start_forwarder_threads(
                 while !exit.load(Ordering::Relaxed) {
                     match reconstruct_rx.recv_timeout(Duration::from_millis(100)) {
                         Ok(pkt_batch) => {
-                            deshred::reconstruct_shreds(
+                            // 🚀 STREAMING OPTIMIZATION: Use streaming version for immediate sending
+                            let entry_sender_clone = entry_sender.clone();
+                            let (_recovered_count, _batch_id) = deshred::reconstruct_shreds_streaming(
                                 pkt_batch,
                                 &mut all_shreds,
                                 &mut slot_fec_indexes_to_iterate,
-                                &mut deshredded_entries,
                                 &mut highest_slot_seen,
                                 &rs_cache,
                                 &metrics,
                                 &mut merkle_shreds_buffer,
-                            );
-
-                            deshredded_entries.drain(..).for_each(
-                                |(slot, _entries, entries_bytes)| {
-                                    let _ = entry_sender.send(PbEntry {
+                                |slot, entries_bytes| {
+                                    // This callback is invoked immediately when entries are ready
+                                    let _ = entry_sender_clone.send(PbEntry {
                                         slot,
                                         entries: entries_bytes,
                                     });
